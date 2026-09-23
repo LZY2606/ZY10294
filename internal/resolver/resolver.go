@@ -75,8 +75,25 @@ func (k Kind) String() string {
 	return "let"
 }
 
+// Capture is how a binding leaves its frame, if it does.
+type Capture uint8
+
+const (
+	// CaptureNone means the binding is only ever read from its own frame.
+	CaptureNone Capture = iota
+	// CaptureClosure means a nested function refers to the binding, so the
+	// frame that owns it must outlive that frame's activation. The evaluator
+	// keeps frames as heap objects shared by pointer, which is exactly what
+	// makes this safe without copying anything.
+	CaptureClosure
+)
+
 // A Binding is one declared name.
 type Binding struct {
+	// ID is the binding's index in the compilation's binding table, 1-based.
+	// Zero is reserved for "no binding", so a resolved name always has a
+	// positive id.
+	ID   int
 	Name string
 	Kind Kind
 	// Mutable reports whether the name may be rebound. Only `var` may.
@@ -85,9 +102,16 @@ type Binding struct {
 	Mutable bool
 	Decl    source.Span
 
+	// Owner is the node whose frame the binding lives in: the program, a
+	// block, a function, a loop, a case arm, a try rescue or a module. It is
+	// nil for predeclared globals, which predate any program.
+	Owner ast.Node
+	// Capture records whether a nested function refers to this binding.
+	Capture Capture
+
 	// Depth is the scope nesting level, 0 for globals. Slot is the index of
-	// this binding within its scope, so an evaluator can use a slice rather
-	// than a map once it wants to.
+	// this binding within its owner's frame. The evaluator allocates one
+	// slice of slots per frame and indexes it with Slot.
 	Depth int
 	Slot  int
 }
@@ -104,6 +128,18 @@ type Info struct {
 	refs  map[*ast.Identifier]Ref
 	decls map[*ast.Identifier]*Binding
 	sizes map[ast.Node]int
+
+	// bindings is the resolved binding table: id minus one indexes it. It is
+	// built during resolution and immutable afterwards — the evaluator reads
+	// slots and spans out of it but never writes back.
+	bindings []*Binding
+	// globals lists the bindings of the global scope in slot order, so the
+	// evaluator can lay its global frame out to match.
+	globals []*Binding
+	// ok is false once any unit reported a diagnostic. A failed resolution
+	// leaves partial ids behind, and an evaluator must refuse to run on them
+	// rather than accept a half-bound program.
+	ok bool
 }
 
 // Lookup returns the binding a name reference resolved to.
@@ -111,6 +147,23 @@ func (i *Info) Lookup(id *ast.Identifier) (Ref, bool) {
 	r, ok := i.refs[id]
 	return r, ok
 }
+
+// Binding returns the binding with the given id, or nil if there is none.
+func (i *Info) Binding(id int) *Binding {
+	if id <= 0 || id > len(i.bindings) {
+		return nil
+	}
+	return i.bindings[id-1]
+}
+
+// Globals returns the global scope's bindings in slot order.
+func (i *Info) Globals() []*Binding { return i.globals }
+
+// OK reports whether resolution completed without any unit reporting a
+// diagnostic. The evaluator refuses to run a program whose Info is not OK:
+// a failed resolution may have left some names unresolved, and executing it
+// would accept a program the resolver rejected.
+func (i *Info) OK() bool { return i.ok }
 
 // Declaration returns the binding a declaring name introduced.
 func (i *Info) Declaration(id *ast.Identifier) (*Binding, bool) {
@@ -126,13 +179,18 @@ type scope struct {
 	parent *scope
 	depth  int
 	names  map[string]*Binding
+	// owner is the AST node whose frame this scope becomes at runtime.
+	owner ast.Node
+	// fn marks a function's scope: crossing it while resolving a name means
+	// the binding is captured by a closure.
+	fn bool
 	// pending holds names declared but whose initializer is still being
 	// resolved, so `let x = x` can be caught while recursion still works.
 	pending map[string]bool
 	slots   int
 }
 
-func newScope(parent *scope) *scope {
+func newScope(parent *scope, owner ast.Node, fn bool) *scope {
 	depth := 0
 	if parent != nil {
 		depth = parent.depth + 1
@@ -140,6 +198,8 @@ func newScope(parent *scope) *scope {
 	return &scope{
 		parent:  parent,
 		depth:   depth,
+		owner:   owner,
+		fn:      fn,
 		names:   map[string]*Binding{},
 		pending: map[string]bool{},
 	}
@@ -190,21 +250,34 @@ func New(file *source.File, diags *diag.Bag) *Resolver {
 			refs:  map[*ast.Identifier]Ref{},
 			decls: map[*ast.Identifier]*Binding{},
 			sizes: map[ast.Node]int{},
+			ok:    true,
 		},
 		modules:       map[string]bool{},
 		hoisted:       map[*Binding]bool{},
 		moduleMembers: map[*Binding][]string{},
 		records:       map[string][]string{},
 	}
-	r.current = newScope(nil)
+	r.current = newScope(nil, nil, false)
 	for _, name := range Builtins {
 		r.predeclare(name, KindBuiltin)
 	}
 	return r
 }
 
-// Predeclare adds a global name, for values supplied by the host rather than by
-// the program.
+// BuiltinSlot is the slot the global frame reserves for a builtin, or -1 if
+// name is not one. The evaluator installs builtins at exactly these slots, so
+// a resolved reference to one is an ordinary slot read.
+func BuiltinSlot(name string) int {
+	for i, n := range Builtins {
+		if n == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// Predeclare adds a global name, for values supplied by the host rather than
+// by the program.
 func (r *Resolver) Predeclare(name string) { r.predeclare(name, KindLet) }
 
 // PredeclareModule adds a module name, for modules supplied by the standard
@@ -216,22 +289,37 @@ func (r *Resolver) Predeclare(name string) { r.predeclare(name, KindLet) }
 // then failed in the evaluator with "'Enum' is not defined".
 func (r *Resolver) PredeclareModule(name string, members ...string) {
 	r.modules[name] = true
-	r.predeclare(name, KindLet)
+	b := r.predeclare(name, KindLet)
 	if len(members) > 0 {
-		r.moduleMembers[r.current.names[name]] = members
+		r.moduleMembers[b] = members
 	}
 }
 
-func (r *Resolver) predeclare(name string, kind Kind) {
-	b := &Binding{Name: name, Kind: kind, Depth: 0, Slot: r.current.slots}
+// predeclare introduces a host-supplied global name.
+//
+// Predeclaring a name that already exists keeps its binding — and therefore
+// its slot — and only updates the kind. The evaluator's global frame is laid
+// out once and every compilation predeclares the same names in slot order, so
+// a slot must never move because a name was announced twice. A builtin
+// predeclared again as a host global reads as `let` in diagnostics, matching
+// the kind the replacing declaration used to get.
+func (r *Resolver) predeclare(name string, kind Kind) *Binding {
+	if b, ok := r.current.names[name]; ok {
+		b.Kind = kind
+		return b
+	}
+	b := r.newBinding(name, kind, false, source.Span{})
 	r.current.slots++
 	r.current.names[name] = b
+	return b
 }
 
 // Resolve walks prog and reports any name problems into the Bag.
 func (r *Resolver) Resolve(prog *ast.Program) *Info {
+	r.own(prog)
 	r.unit(prog)
 	r.info.sizes[prog] = r.current.slots
+	r.check()
 	return r.info
 }
 
@@ -251,8 +339,10 @@ func (r *Resolver) Include(file *source.File, prog *ast.Program, diags *diag.Bag
 	r.file, r.diags = file, diags
 	defer func() { r.file, r.diags = outerFile, outerDiags }()
 
+	r.own(prog)
 	r.unit(prog)
 	r.info.sizes[prog] = r.current.slots
+	r.check()
 }
 
 // IncludeNamespaced resolves an imported unit whose names live under an alias,
@@ -263,7 +353,7 @@ func (r *Resolver) IncludeNamespaced(file *source.File, prog *ast.Program, diags
 	r.file, r.diags = file, diags
 	defer func() { r.file, r.diags = outerFile, outerDiags }()
 
-	r.push()
+	r.push(prog)
 	r.unit(prog)
 	members := []string{}
 	for _, n := range prog.Nodes {
@@ -287,6 +377,23 @@ func (r *Resolver) IncludeNamespaced(file *source.File, prog *ast.Program, diags
 	r.modules[alias] = true
 	r.predeclare(alias, KindLet)
 	r.moduleMembers[r.current.names[alias]] = members
+	r.check()
+}
+
+// own records prog as the global scope's owner, the first time a unit claims
+// it. Predeclared globals keep a nil owner.
+func (r *Resolver) own(prog *ast.Program) {
+	if r.current.owner == nil {
+		r.current.owner = prog
+	}
+}
+
+// check notes whether the unit just resolved reported anything. Once any unit
+// has, the Info is tainted and the evaluator will refuse to run on it.
+func (r *Resolver) check() {
+	if r.diags.HasErrors() {
+		r.info.ok = false
+	}
 }
 
 // aliasedDeclaration reports a module or record in a file imported under an
@@ -412,7 +519,11 @@ func (r *Resolver) hoistFunctions(nodes []ast.Node) {
 // Scopes
 // ---------------------------------------------------------------------------
 
-func (r *Resolver) push() { r.current = newScope(r.current) }
+func (r *Resolver) push(owner ast.Node) { r.current = newScope(r.current, owner, false) }
+
+// pushFunc opens a function's scope, which is a capture boundary: a name
+// resolved across it is captured by the closure.
+func (r *Resolver) pushFunc(owner ast.Node) { r.current = newScope(r.current, owner, true) }
 
 // pop leaves the current scope, recording its size against the node that owns
 // it so an evaluator knows how many slots to allocate.
@@ -440,17 +551,31 @@ func (r *Resolver) declare(id *ast.Identifier, kind Kind, mutable bool) *Binding
 		return prev
 	}
 
-	b := &Binding{
-		Name:    id.Value,
-		Kind:    kind,
-		Mutable: mutable,
-		Decl:    id.Span(),
-		Depth:   r.current.depth,
-		Slot:    r.current.slots,
-	}
+	b := r.newBinding(id.Value, kind, mutable, id.Span())
 	r.current.slots++
 	r.current.names[id.Value] = b
 	r.info.decls[id] = b
+	id.Binding = b.ID
+	return b
+}
+
+// newBinding allocates a binding in the current scope and enters it in the
+// table. Slot assignment stays with the caller, which owns the counter.
+func (r *Resolver) newBinding(name string, kind Kind, mutable bool, decl source.Span) *Binding {
+	b := &Binding{
+		ID:      len(r.info.bindings) + 1,
+		Name:    name,
+		Kind:    kind,
+		Mutable: mutable,
+		Decl:    decl,
+		Owner:   r.current.owner,
+		Depth:   r.current.depth,
+		Slot:    r.current.slots,
+	}
+	r.info.bindings = append(r.info.bindings, b)
+	if r.current.parent == nil {
+		r.info.globals = append(r.info.globals, b)
+	}
 	return b
 }
 
@@ -470,15 +595,47 @@ func (r *Resolver) resolveName(id *ast.Identifier) {
 	}
 
 	hops := 0
+	captured := false
 	for s := r.current; s != nil; s = s.parent {
 		if b, ok := s.names[id.Value]; ok {
+			if captured {
+				b.Capture = CaptureClosure
+			}
 			r.info.refs[id] = Ref{Binding: b, Hops: hops}
+			id.Binding, id.Hops = b.ID, hops
 			return
+		}
+		// Leaving a function's scope on the way out means the use runs inside
+		// a closure whose frame is not the binding's own.
+		if s.fn {
+			captured = true
 		}
 		hops++
 	}
 
 	r.diags.Errorf(id.Span(), "'%s' is not defined", id.Value)
+}
+
+// declareHere declares a module or record name that collectModules did not
+// hoist — one written inside a function. A name already known, whether as a
+// binding in this scope or as a hoisted module or record, is left alone: the
+// duplicate is the evaluator's to report, with the module's or record's own
+// redeclaration message.
+func (r *Resolver) declareHere(id *ast.Identifier) {
+	if id == nil {
+		return
+	}
+	if b, ok := r.current.names[id.Value]; ok {
+		// Already bound — hoisted, or predeclared as a module the host
+		// supplies. The declaration still needs its stamp, since the
+		// evaluator defines the name through it.
+		id.Binding = b.ID
+		return
+	}
+	if r.modules[id.Value] || r.records[id.Value] != nil {
+		return
+	}
+	r.declare(id, KindLet, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +653,7 @@ func (r *Resolver) node(n ast.Node) {
 		}
 
 	case *ast.Block:
-		r.push()
+		r.push(n)
 		for _, c := range n.Nodes {
 			r.node(c)
 		}
@@ -571,7 +728,7 @@ func (r *Resolver) node(n ast.Node) {
 			// nowhere else, so the arm gets a scope of its own. The body's own
 			// Block would push a second one; resolve its contents directly so
 			// captures and body names share one level.
-			r.push()
+			r.push(c)
 			// A case value may be `_`, the wildcard, and an array pattern may
 			// hold them too. Walk the elements rather than the list so a
 			// placeholder is not reported as one out of position.
@@ -599,7 +756,7 @@ func (r *Resolver) node(n ast.Node) {
 		// The rescue's name is bound for the rescue block and nowhere else, so
 		// it gets a scope of its own — the block's own Block would push a
 		// second one, so its contents are resolved directly.
-		r.push()
+		r.push(n)
 		if n.Name != nil {
 			r.declare(n.Name, KindLet, false)
 		}
@@ -625,8 +782,11 @@ func (r *Resolver) node(n ast.Node) {
 	case *ast.Module:
 		r.module(n)
 	case *ast.Record:
-		// The name is declared by collectModules; the field hints and defaults
-		// are what is left to check, exactly as for a function's parameters.
+		// Like a module, a record written inside a function is declared where
+		// it stands; collectModules hoists only the top level.
+		r.declareHere(n.Name)
+		// The field hints and defaults are what is left to check, exactly as
+		// for a function's parameters.
 		for _, f := range n.Fields {
 			if f == nil {
 				continue
@@ -783,6 +943,7 @@ func (r *Resolver) binding(name *ast.Identifier, value ast.Node, kind Kind, muta
 	if b, ok := r.current.names[name.Value]; ok && r.hoisted[b] {
 		delete(r.hoisted, b)
 		r.info.decls[name] = b
+		name.Binding = b.ID
 	} else {
 		r.declare(name, kind, mutable)
 	}
@@ -858,7 +1019,7 @@ func (r *Resolver) assign(n *ast.Assign) {
 func (r *Resolver) forLoop(n *ast.For) {
 	r.node(n.Enumerable)
 
-	r.push()
+	r.push(n)
 	if n.Arguments != nil {
 		// The evaluator checked this per iteration, so an empty enumerable
 		// never reached it and `for a, b, c in []` was accepted. The count is
@@ -908,7 +1069,7 @@ func (r *Resolver) function(n *ast.Function) {
 	}
 	r.typeName(n.ReturnType)
 
-	r.push()
+	r.pushFunc(n)
 	for _, p := range n.Parameters {
 		if p == nil {
 			continue
@@ -940,7 +1101,12 @@ func (r *Resolver) module(n *ast.Module) {
 		return
 	}
 
-	r.push()
+	// A module written inside a function is declared where it stands; only
+	// the top level is hoisted by collectModules. The evaluator needs the
+	// binding either way, since it defines the name through it.
+	r.declareHere(n.Name)
+
+	r.push(n)
 
 	// First pass: declare every member. A module body accepts only `let`, which
 	// the evaluator reported at runtime for a mistake plainly visible here.

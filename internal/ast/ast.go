@@ -90,6 +90,15 @@ func HasBad(n Node) bool {
 type Identifier struct {
 	Base
 	Value string
+
+	// Binding and Hops are the resolution of this name, stamped by the
+	// resolver. Binding is the id of the binding the name refers to in the
+	// compilation's binding table — 0 means unresolved, which the evaluator
+	// treats as "not defined". Hops is how many frames up from the use site
+	// the binding lives. After resolution a name is only ever a reference to
+	// a binding id; the string is kept for diagnostics and display.
+	Binding int
+	Hops    int
 }
 
 func (n *Identifier) Inspect() string { return n.Value }

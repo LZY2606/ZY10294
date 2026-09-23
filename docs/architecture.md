@@ -250,9 +250,39 @@ program starts, and each was silent or late:
 - More than two `for` loop variables. The evaluator checked this inside the per-iteration
   closure, so `for a, b, c in []` never reached the check at all.
 
-The resolver records a slot index and scope depth for every binding. The evaluator does
-not use them yet — it walks a scope chain of name maps — but they are there for when
-lookup becomes worth optimising.
+### Resolution produces a binding table, and the evaluator runs on it
+
+Resolution's output is one immutable table of bindings. Each records the declaration
+span, the kind and mutability, the node that owns the frame it lives in, a slot index
+within that frame, and a capture mode — whether a nested function refers to it, which is
+what requires the frame to outlive its activation. Every binding has a dense 1-based id,
+and after resolution an `ast.Identifier` carries that id plus a hop count: how many
+frames up from the use site the binding lives. The name string stays on the node, but
+only for diagnostics and display.
+
+The evaluator's scope is a frame: a slice of slots sized from the table, linked to the
+enclosing frame. Reading a name walks exactly the stamped number of hops and indexes one
+slot; there is no name-keyed map in the hot path and nothing that scans a chain of them.
+`let`, `var`, parameters and loop variables are all the same mechanism — a binding id
+and a slot — where before each had drifted into its own representation. A closure holds
+its defining frame by pointer, so a captured binding survives its frame's activation
+without copying any environment, and a loop body gets a fresh frame per iteration, which
+is what makes a closure capture that iteration's variables.
+
+Two edges keep a name-keyed path, by design. Builtins and host-seeded values are
+installed into the global frame by name, at slots the resolver's own numbering fixes, so
+a resolved reference to one is still an ordinary slot read. And module members stay a
+dynamic lookup on the module value, because an imported file's members are not all
+visible to one compilation's resolver. Everything else — every name the resolver bound —
+is a binding id end to end.
+
+A failed resolution taints the whole `Info`: some names never got ids, and the evaluator
+refuses to run on it rather than accept the ones that did. The pipeline already never
+evaluates a program with diagnostics; this makes the refusal a property of the evaluator
+and not only of the callers' discipline.
+
+`Interp.Stats` counts frames, slot reads and writes, and name-chain fallbacks. The last
+is zero for any resolved program, which is what the counting test asserts.
 
 ## Values
 
@@ -995,34 +1025,7 @@ itself a compatibility break.
 
 ## Known gaps
 
-- **Slot-based scopes.** The resolver computes slot indices and scope sizes that the
-  evaluator ignores, walking a chain of name maps instead. Switching would make lookup an
-  array index.
-
-  There is a number attached to part of this. `BenchmarkMicro/name-lookup-deep` and
-  `name-lookup-shallow` run the same loop and the same arithmetic, differing only in
-  whether the names come from three scopes up or from beside the loop. On one machine the
-  deep case costs around a fifth more time and **ten more allocations out of eleven
-  thousand**: the chain costs pointer chasing, not garbage.
-
-  That bounds the chain-walking half and nothing else, which is worth being precise about.
-  Both cases pay exactly one *successful* map lookup, so what the difference measures is
-  the *failed* lookups at the scopes in between. Replacing that final map lookup with an
-  array index is the other half of what slots would do, and no benchmark here can see it.
-  So a fifth is not the ceiling on slots; it is the ceiling on the part that has been
-  measured, in a case built to make the chain as expensive as possible.
-
-  The cheaper half can be had on its own. `Ref.Hops` already says how far up the binding
-  lives, so the evaluator could walk exactly that many parents and do one map lookup
-  instead of up to `Hops + 1`. That collects the whole measured difference while `vars`
-  stays a map, with no scope sizes to plumb through and no change to `define` or `assign`.
-
-  Either version is a bigger step than swapping a data structure, because the evaluator has
-  no runtime dependency on resolution at all: `i.info` is assigned in two places and read
-  in none. Both would introduce one, and the name-keyed paths that would still need names
-  are real — the REPL's `:vars` walks `globals.vars`, an aliased import builds its module
-  by reading `scope.vars[name]`, and four `New(file, nil)` call sites have no `Info` to
-  consult.
-
-  Measure with benchstat before believing any of this, and before spending a rewrite on
-  it.
+- **Register windows.** Frames are heap-allocated slices, one per scope entry, and a
+  function call allocates one. A calling convention that carved frames out of a single
+  stack would remove most of those allocations; the binding table already carries every
+  number it would need.

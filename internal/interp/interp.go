@@ -14,6 +14,13 @@
 //
 // Collections are immutable. `a[] = v` rebinds `a` to a new collection rather
 // than growing one in place, so no operator can corrupt its own operand.
+//
+// And names are resolved, not looked up. The resolver's binding table gives
+// every name a binding id, a hop count and a slot; a scope at runtime is a
+// frame of slots allocated from that table, and reading a name is a walk of
+// exactly its hop count and one index. The only name-keyed paths left are the
+// dynamic edges the resolver cannot see: builtins and host-seeded globals, and
+// module members.
 package interp
 
 import (
@@ -23,6 +30,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/fadion/aria/internal/ast"
@@ -56,41 +64,85 @@ const (
 	sigContinue
 )
 
-// env is one lexical scope at runtime.
+// env is one lexical scope at runtime: a frame of slots, one per binding the
+// resolver counted for the scope, plus a link to the enclosing frame.
 //
-// Lookup walks outward from the innermost scope, so an inner declaration
-// naturally hides an outer one. The resolver has already proved every name
-// resolves and that no immutable binding is assigned to, so nothing here needs
-// to re-check either.
+// A resolved name is a (hops, slot) pair, never a string: the evaluator walks
+// exactly hops frame links and indexes the slot. There is no name-keyed map to
+// scan, so an inner declaration hiding an outer one is the resolver's doing,
+// not something lookup re-enacts. Closures hold their defining frame by
+// pointer, which is what lets a captured binding outlive its activation
+// without copying anything.
+//
+// The global frame additionally keeps names, a name-to-slot index for the
+// dynamic edges the resolver cannot see: values seeded by the host, and module
+// registration. Those are the only name-keyed paths left.
 type env struct {
 	parent *env
-	vars   map[string]value.Value
+	slots  []value.Value
+	// names is nil for every frame but the global one.
+	names map[string]int
 }
 
-func newEnv(parent *env) *env {
-	return &env{parent: parent, vars: map[string]value.Value{}}
-}
-
-func (e *env) lookup(name string) (value.Value, bool) {
-	for s := e; s != nil; s = s.parent {
-		if v, ok := s.vars[name]; ok {
-			return v, true
-		}
+// get reads a slot, answering nil for one nothing has written yet.
+func (e *env) get(slot int) value.Value {
+	if slot < 0 || slot >= len(e.slots) {
+		return nil
 	}
-	return nil, false
+	return e.slots[slot]
 }
 
-func (e *env) define(name string, v value.Value) { e.vars[name] = v }
-
-// assign writes to the scope that owns name, reporting whether it found one.
-func (e *env) assign(name string, v value.Value) bool {
-	for s := e; s != nil; s = s.parent {
-		if _, ok := s.vars[name]; ok {
-			s.vars[name] = v
-			return true
-		}
+// set writes a slot, growing the frame if the slot is past its end. Only the
+// global frame ever grows; a local frame is allocated at its final size.
+func (e *env) set(slot int, v value.Value) {
+	for len(e.slots) <= slot {
+		e.slots = append(e.slots, nil)
 	}
-	return false
+	e.slots[slot] = v
+}
+
+// reserve records that name belongs at slot in the global frame, growing it.
+// Adopting a compilation's global layout is what keeps later compilations
+// numbering the same names the same way.
+func (e *env) reserve(name string, slot int) {
+	for len(e.slots) <= slot {
+		e.slots = append(e.slots, nil)
+	}
+	if _, ok := e.names[name]; !ok {
+		e.names[name] = slot
+	}
+}
+
+// defineName writes a global by name, for the dynamic edges: a host seeding
+// values, or a module registered under an alias. A name the resolver already
+// placed keeps its slot; a genuinely new one takes the next one.
+func (e *env) defineName(name string, v value.Value) {
+	if slot, ok := e.names[name]; ok {
+		e.set(slot, v)
+		return
+	}
+	slot := len(e.slots)
+	e.set(slot, v)
+	e.names[name] = slot
+}
+
+// namesInSlotOrder lists the global names the way a resolver must predeclare
+// them to reproduce this frame's layout.
+func (e *env) namesInSlotOrder() []string {
+	type named struct {
+		name string
+		slot int
+	}
+	pairs := make([]named, 0, len(e.names))
+	for name, slot := range e.names {
+		pairs = append(pairs, named{name, slot})
+	}
+	sort.Slice(pairs, func(a, b int) bool { return pairs[a].slot < pairs[b].slot })
+	out := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.name)
+	}
+	return out
 }
 
 // Interp evaluates programs.
@@ -122,7 +174,27 @@ type Interp struct {
 	// lives in, so a fault inside it is reported against that file, and its
 	// depth is what bounds recursion.
 	frames []frame
+
+	// stats counts what name resolution costs at runtime, so a test can
+	// prove the hot path never scans for a name.
+	stats Stats
 }
+
+// Stats counts the evaluator's binding traffic.
+type Stats struct {
+	// Frames is how many scope frames were allocated.
+	Frames int
+	// SlotReads and SlotWrites are resolved-name accesses through the
+	// binding table.
+	SlotReads  int
+	SlotWrites int
+	// NameScans is how often a name fell back to a string lookup. A resolved
+	// program never does: every name it evaluates carries a binding id.
+	NameScans int
+}
+
+// Stats returns a copy of the evaluator's counters.
+func (i *Interp) Stats() Stats { return i.stats }
 
 // maxCallDepth bounds recursion, for the reason the parser bounds nesting at
 // 250: exhausting the goroutine stack kills the process with a Go traceback,
@@ -147,7 +219,7 @@ func New(file *source.File, info *resolver.Info) *Interp {
 		Out:      os.Stdout,
 		Err:      os.Stderr,
 		In:       os.Stdin,
-		globals:  newEnv(nil),
+		globals:  &env{names: map[string]int{}},
 		modules:  map[string]*Module{},
 		records:  map[string]*RecordDef{},
 		imported: map[string]bool{},
@@ -167,6 +239,13 @@ func (i *Interp) Modules() map[string]*Module { return i.modules }
 // Run evaluates prog. It returns the program's final value, or an error if a
 // runtime failure stopped it.
 func (i *Interp) Run(prog *ast.Program) (result value.Value, err error) {
+	if i.info == nil || !i.info.OK() {
+		// A program is only ever evaluated after a clean resolution. A failed
+		// resolution leaves some names without binding ids, and running it
+		// would accept a program the resolver rejected.
+		return nil, fmt.Errorf("interp: the program did not resolve cleanly; refusing to evaluate")
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			re, ok := r.(*Error)
@@ -223,8 +302,80 @@ func (i *Interp) hoistFunctions(nodes []ast.Node, e *env) {
 		if !isFunc {
 			continue
 		}
-		e.define(let.Name.Value, &Function{Decl: fn, Env: e, File: file})
+		i.define(e, let.Name, &Function{Decl: fn, Env: e, File: file, Info: i.info})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Resolved names
+// ---------------------------------------------------------------------------
+
+// frame allocates one scope's runtime frame. The size comes from the binding
+// table: the resolver counted the scope's bindings, so a local frame never
+// grows and never needs to know a name.
+func (i *Interp) frame(parent *env, owner ast.Node) *env {
+	size := 0
+	if i.info != nil {
+		size = i.info.ScopeSize(owner)
+	}
+	i.stats.Frames++
+	return &env{parent: parent, slots: make([]value.Value, size)}
+}
+
+// bindingOf resolves a stamped name to its table entry, failing the program
+// if the name was never resolved. Reaching the failure means the evaluator is
+// running a program the resolver did not accept — the two passes disagree,
+// which the pipeline is built to make impossible.
+func (i *Interp) bindingOf(id *ast.Identifier, span source.Span) *resolver.Binding {
+	var b *resolver.Binding
+	if i.info != nil {
+		b = i.info.Binding(id.Binding)
+	}
+	if b == nil {
+		i.stats.NameScans++
+		i.fail(span, "'%s' is not defined", id.Value)
+	}
+	return b
+}
+
+// read evaluates a resolved name: hops frames up, one slot index.
+func (i *Interp) read(e *env, id *ast.Identifier) value.Value {
+	b := i.bindingOf(id, id.Span())
+	for h := id.Hops; h > 0; h-- {
+		e = e.parent
+		if e == nil {
+			i.stats.NameScans++
+			i.fail(id.Span(), "'%s' is not defined", id.Value)
+		}
+	}
+	i.stats.SlotReads++
+	return e.get(b.Slot)
+}
+
+// define binds a declaration in the current frame.
+func (i *Interp) define(e *env, id *ast.Identifier, v value.Value) {
+	b := i.bindingOf(id, id.Span())
+	e.set(b.Slot, v)
+	if e.names != nil {
+		// The global frame remembers its layout, so the next compilation
+		// predeclares the same names into the same slots.
+		e.names[b.Name] = b.Slot
+	}
+	i.stats.SlotWrites++
+}
+
+// write rebinds a resolved name in the frame that owns it.
+func (i *Interp) write(e *env, id *ast.Identifier, v value.Value) {
+	b := i.bindingOf(id, id.Span())
+	for h := id.Hops; h > 0; h-- {
+		e = e.parent
+		if e == nil {
+			i.stats.NameScans++
+			i.fail(id.Span(), "'%s' is not defined", id.Value)
+		}
+	}
+	e.set(b.Slot, v)
+	i.stats.SlotWrites++
 }
 
 // fail stops evaluation with a runtime error. Unwinding rather than returning a
@@ -276,16 +427,12 @@ func (i *Interp) eval(n ast.Node, e *env) value.Value {
 		return value.NilValue
 
 	case *ast.Identifier:
-		v, ok := e.lookup(n.Value)
-		if !ok {
-			// The resolver proves this cannot happen for a resolved program;
-			// reaching it means the two disagree about scoping.
-			i.fail(n.Span(), "'%s' is not defined", n.Value)
-		}
-		return v
+		// The resolver proves this resolves for a resolved program; read is
+		// the one whose failure means the two passes disagree about scoping.
+		return i.read(e, n)
 
 	case *ast.Block:
-		return i.evalBlock(n, newEnv(e))
+		return i.evalBlock(n, i.frame(e, n))
 
 	case *ast.Let:
 		v := i.eval(n.Value, e)
@@ -293,7 +440,7 @@ func (i *Interp) eval(n ast.Node, e *env) value.Value {
 			i.destructure(n.Pattern, v, e, n.Span())
 			return v
 		}
-		e.define(n.Name.Value, v)
+		i.define(e, n.Name, v)
 		return v
 	case *ast.Var:
 		v := i.eval(n.Value, e)
@@ -301,7 +448,7 @@ func (i *Interp) eval(n ast.Node, e *env) value.Value {
 			i.destructure(n.Pattern, v, e, n.Span())
 			return v
 		}
-		e.define(n.Name.Value, v)
+		i.define(e, n.Name, v)
 		return v
 	case *ast.Assign:
 		return i.evalAssign(n, e)
@@ -353,10 +500,10 @@ func (i *Interp) eval(n ast.Node, e *env) value.Value {
 
 	case *ast.If:
 		if value.Truthy(i.eval(n.Condition, e)) {
-			return i.evalBlock(n.Then, newEnv(e))
+			return i.evalBlock(n.Then, i.frame(e, n.Then))
 		}
 		if n.Else != nil {
-			return i.evalBlock(n.Else, newEnv(e))
+			return i.evalBlock(n.Else, i.frame(e, n.Else))
 		}
 		return value.NilValue
 
@@ -370,7 +517,7 @@ func (i *Interp) eval(n ast.Node, e *env) value.Value {
 		return i.evalTry(n, e)
 
 	case *ast.Function:
-		return &Function{Decl: n, Env: e, File: i.curFile()}
+		return &Function{Decl: n, Env: e, File: i.curFile(), Info: i.info}
 	case *ast.FunctionCall:
 		return i.evalCall(n, e)
 
@@ -437,12 +584,7 @@ func (i *Interp) evalAssign(n *ast.Assign, e *env) value.Value {
 		i.fail(n.Span(), "assignment expects a name on the left")
 	}
 
-	current, found := e.lookup(id.Value)
-	if !found {
-		i.fail(id.Span(), "'%s' is not defined", id.Value)
-	}
-
-	updated := i.updatePath(current, path, rhs, e, n.Span())
+	updated := i.updatePath(i.read(e, id), path, rhs, e, n.Span())
 	i.assignChecked(id, updated, e)
 	return rhs
 }
@@ -477,8 +619,8 @@ func flattenTarget(n ast.Node) (ast.Node, []targetStep) {
 
 // assignChecked writes v to name, enforcing the type lock.
 func (i *Interp) assignChecked(id *ast.Identifier, v value.Value, e *env) {
-	old, found := e.lookup(id.Value)
-	if !found {
+	old := i.read(e, id)
+	if old == nil {
 		i.fail(id.Span(), "'%s' is not defined", id.Value)
 	}
 	// Reassignment preserves the original type. Nil is exempt, since a binding
@@ -488,9 +630,7 @@ func (i *Interp) assignChecked(id *ast.Identifier, v value.Value, e *env) {
 		i.fail(id.Span(), "'%s' holds %s, so it cannot be assigned %s",
 			id.Value, value.TypeName(old), value.TypeName(v))
 	}
-	if !e.assign(id.Value, v) {
-		i.fail(id.Span(), "'%s' is not defined", id.Value)
-	}
+	i.write(e, id, v)
 }
 
 // updatePath returns a copy of container with the value at path replaced.
@@ -786,13 +926,13 @@ func (i *Interp) evalSwitch(n *ast.Switch, e *env) value.Value {
 		// An arm's captures are bound into a scope of its own, which the guard
 		// and the body then share. Matching writes into it as it goes, so a
 		// failed arm leaves nothing behind.
-		arm := newEnv(e)
+		arm := i.frame(e, c)
 		if i.caseMatches(c, control, arm) {
 			return i.evalBlock(c.Body, arm)
 		}
 	}
 	if n.Default != nil {
-		return i.evalBlock(n.Default, newEnv(e))
+		return i.evalBlock(n.Default, i.frame(e, n.Default))
 	}
 	return value.NilValue
 }
@@ -832,7 +972,7 @@ func (i *Interp) caseValueMatches(el ast.Node, control value.Value, e *env) bool
 
 	case *ast.Binder:
 		// `let name` captures whatever is here, matching anything.
-		e.define(el.Name.Value, control)
+		i.define(e, el.Name, control)
 		return true
 
 	case *ast.TypeCase:
@@ -1024,30 +1164,30 @@ func forever() iter {
 // the loop.
 func (i *Interp) loop(n *ast.For, e *env, next iter) value.Value {
 	var results []value.Value
-	names := []string{}
+	vars := []*ast.Identifier{}
 	if n.Arguments != nil {
-		for _, id := range n.Arguments.Elements {
-			names = append(names, id.Value)
-		}
+		vars = n.Arguments.Elements
 	}
 
 	// The resolver rejects more than two loop variables, so this is a backstop
 	// for the one path that never reaches the resolver: an imported file, which
 	// is parsed and evaluated but not resolved. It is checked once rather than
 	// per iteration, which is why `for a, b, c in []` used to be accepted.
-	if len(names) > 2 {
-		i.fail(n.Span(), "a for loop takes at most 2 variables, got %d", len(names))
+	if len(vars) > 2 {
+		i.fail(n.Span(), "a for loop takes at most 2 variables, got %d", len(vars))
 	}
 
 	run := func(it item) bool {
-		scope := newEnv(e)
-		switch len(names) {
+		// A fresh frame per iteration is what makes a closure capture THIS
+		// iteration's variables rather than a variable shared by all of them.
+		scope := i.frame(e, n)
+		switch len(vars) {
 		case 0:
 		case 1:
-			scope.define(names[0], it.val)
+			i.define(scope, vars[0], it.val)
 		case 2:
-			scope.define(names[0], it.key)
-			scope.define(names[1], it.val)
+			i.define(scope, vars[0], it.key)
+			i.define(scope, vars[1], it.val)
 		}
 
 		v := i.evalBlock(n.Body, scope)
@@ -1100,7 +1240,7 @@ func (i *Interp) evalWhile(n *ast.While, e *env) value.Value {
 			return value.NilValue
 		}
 
-		i.evalBlock(n.Body, newEnv(e))
+		i.evalBlock(n.Body, i.frame(e, n.Body))
 
 		switch i.signal {
 		case sigBreak:
@@ -1617,13 +1757,13 @@ func (i *Interp) destructure(pattern *ast.ArrayPattern, v value.Value, e *env, s
 
 		switch el := el.(type) {
 		case *ast.Identifier:
-			e.define(el.Value, arr.At(at))
+			i.define(e, el, arr.At(at))
 		case *ast.Placeholder:
 			// A hole, binding nothing.
 		case *ast.ArrayPattern:
 			i.destructure(el, arr.At(at), e, span)
 		case *ast.Rest:
-			e.define(el.Name.Value, value.NewArray(append([]value.Value{}, arr.Elems()[idx:arr.Len()-after]...)))
+			i.define(e, el.Name, value.NewArray(append([]value.Value{}, arr.Elems()[idx:arr.Len()-after]...)))
 		}
 	}
 }
@@ -1655,9 +1795,9 @@ func (i *Interp) evalTry(n *ast.Try, e *env) value.Value {
 	// The failure aborted whatever control transfer was in flight.
 	i.signal, i.breaking, i.retval = sigNone, 0, nil
 
-	scope := newEnv(e)
+	scope := i.frame(e, n)
 	if n.Name != nil {
-		scope.define(n.Name.Value, i.errorValue(caught))
+		i.define(scope, n.Name, i.errorValue(caught))
 	}
 	return i.evalBlock(n.Rescue, scope)
 }
@@ -1678,7 +1818,7 @@ func (i *Interp) attempt(b *ast.Block, e *env) (result value.Value, caught *Erro
 		result, caught = value.NilValue, re
 	}()
 
-	return i.evalBlock(b, newEnv(e)), nil
+	return i.evalBlock(b, i.frame(e, b)), nil
 }
 
 // errorValue renders a runtime error as an ordinary Aria value.
