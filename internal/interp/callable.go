@@ -2,6 +2,7 @@ package interp
 
 import (
 	"github.com/fadion/aria/internal/ast"
+	"github.com/fadion/aria/internal/resolver"
 	"github.com/fadion/aria/internal/source"
 	"github.com/fadion/aria/internal/value"
 )
@@ -16,6 +17,11 @@ type Function struct {
 	Decl *ast.Function
 	Env  *env
 	File *source.File
+	// Info is the binding table of the compilation the body was resolved
+	// with. A function defined by one compilation — the standard library, an
+	// earlier REPL line — and called from another keeps its own, since its
+	// body's binding ids index that table, not the caller's.
+	Info *resolver.Info
 }
 
 func (*Function) Type() value.Type { return value.TFunc }
@@ -125,8 +131,16 @@ func (i *Interp) callFunction(fn *Function, args []value.Value, span source.Span
 	i.frames = append(i.frames, frame{file: fn.File, span: span})
 	defer func() { i.frames = i.frames[:len(i.frames)-1] }()
 
+	// The body was resolved against its own compilation's table, so evaluate
+	// it with that table in place rather than the caller's.
+	outerInfo := i.info
+	if fn.Info != nil {
+		i.info = fn.Info
+	}
+	defer func() { i.info = outerInfo }()
+
 	decl := fn.Decl
-	scope := newEnv(fn.Env)
+	scope := i.frame(fn.Env, decl)
 
 	fixed := len(decl.Parameters)
 	if decl.Variadic {
@@ -147,7 +161,7 @@ func (i *Interp) callFunction(fn *Function, args []value.Value, span source.Span
 		// and the hint was a lie for every caller that omitted the argument.
 		def := i.eval(p.Default, fn.Env)
 		i.checkParamType(p, def, i.curFile(), p.Default.Span())
-		scope.define(p.Name.Value, def)
+		i.define(scope, p.Name, def)
 	}
 
 	if len(args) < required {
@@ -160,7 +174,7 @@ func (i *Interp) callFunction(fn *Function, args []value.Value, span source.Span
 	for idx := 0; idx < fixed && idx < len(args); idx++ {
 		p := decl.Parameters[idx]
 		i.checkParamType(p, args[idx], callerFile, span)
-		scope.define(p.Name.Value, args[idx])
+		i.define(scope, p.Name, args[idx])
 	}
 
 	if decl.Variadic {
@@ -169,7 +183,7 @@ func (i *Interp) callFunction(fn *Function, args []value.Value, span source.Span
 			rest = append(rest, args[fixed:]...)
 		}
 		last := decl.Parameters[len(decl.Parameters)-1]
-		scope.define(last.Name.Value, value.NewArray(rest))
+		i.define(scope, last.Name, value.NewArray(rest))
 	}
 
 	result := i.evalBlock(decl.Body, scope)
@@ -212,7 +226,7 @@ func (i *Interp) evalModule(n *ast.Module, e *env) {
 		i.fail(n.Name.Span(), "module '%s' is already declared", n.Name.Value)
 	}
 
-	scope := newEnv(e)
+	scope := i.frame(e, n)
 	m := &Module{Name: n.Name.Value, members: map[string]value.Value{}}
 	// Register before evaluating, so a member closing over the module can name
 	// it, and so a self-referential member resolves.
@@ -224,12 +238,10 @@ func (i *Interp) evalModule(n *ast.Module, e *env) {
 	i.modules[n.Name.Value] = m
 	// A builtin of the same name is carried rather than shadowed: `String` is
 	// both a conversion and a module, and as a value it has to be one thing.
-	if prev, ok := e.lookup(n.Name.Value); ok {
-		if b, isBuiltin := prev.(*Builtin); isBuiltin {
-			m.call = b
-		}
+	if prev, ok := i.read(e, n.Name).(*Builtin); ok {
+		m.call = prev
 	}
-	e.define(n.Name.Value, m)
+	i.define(e, n.Name, m)
 
 	for _, node := range n.Body.Nodes {
 		let, ok := node.(*ast.Let)
@@ -237,7 +249,7 @@ func (i *Interp) evalModule(n *ast.Module, e *env) {
 			i.fail(node.Span(), "a module body accepts only 'let' declarations")
 		}
 		v := i.eval(let.Value, scope)
-		scope.define(let.Name.Value, v)
+		i.define(scope, let.Name, v)
 		if _, seen := m.members[let.Name.Value]; !seen {
 			m.order = append(m.order, let.Name.Value)
 		}

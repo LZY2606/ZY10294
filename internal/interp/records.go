@@ -2,6 +2,7 @@ package interp
 
 import (
 	"github.com/fadion/aria/internal/ast"
+	"github.com/fadion/aria/internal/resolver"
 	"github.com/fadion/aria/internal/source"
 	"github.com/fadion/aria/internal/value"
 )
@@ -23,6 +24,9 @@ type RecordDef struct {
 	// File is where the declaration was written, so a fault building an
 	// instance is reported there.
 	File *source.File
+	// Info is the binding table the declaration was resolved with, which a
+	// field default's ids index into.
+	Info *resolver.Info
 }
 
 func (*RecordDef) Type() value.Type       { return value.TRecord }
@@ -54,9 +58,10 @@ func (i *Interp) evalRecord(n *ast.Record, e *env) value.Value {
 		Decl: n,
 		Def:  &value.RecordType{Name: n.Name.Value, Fields: fields},
 		File: i.curFile(),
+		Info: i.info,
 	}
 	i.records[n.Name.Value] = def
-	e.define(n.Name.Value, def)
+	i.define(e, n.Name, def)
 	return def
 }
 
@@ -92,8 +97,13 @@ func (i *Interp) construct(def *RecordDef, args []value.Value, span source.Span)
 			// which is where a fault in one belongs.
 			outer := i.file
 			i.file = def.File
+			outerInfo := i.info
+			if def.Info != nil {
+				i.info = def.Info
+			}
 			values[idx] = i.eval(f.Default, i.globals)
 			i.file = outer
+			i.info = outerInfo
 		}
 		i.checkFieldType(def, f, values[idx], callerFile, span)
 	}

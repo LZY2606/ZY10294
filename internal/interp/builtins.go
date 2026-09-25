@@ -15,6 +15,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/fadion/aria/internal/resolver"
 	"github.com/fadion/aria/internal/source"
 	"github.com/fadion/aria/internal/value"
 )
@@ -22,7 +23,11 @@ import (
 // installBuiltins seeds the global scope with the runtime functions.
 func (i *Interp) installBuiltins() {
 	def := func(name string, fn func(*Interp, []value.Value, source.Span) value.Value) {
-		i.globals.define(name, &Builtin{Name: name, Fn: fn})
+		// Each builtin lives at the slot the resolver numbers for it, so a
+		// resolved reference to one is an ordinary slot read rather than a
+		// special case.
+		i.globals.reserve(name, resolver.BuiltinSlot(name))
+		i.globals.set(resolver.BuiltinSlot(name), &Builtin{Name: name, Fn: fn})
 	}
 
 	// println and print take any number of arguments, joined with a space.

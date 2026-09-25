@@ -147,13 +147,14 @@ func (i *Interp) loadStdlib(errOut io.Writer) bool {
 		file := source.NewFile(m.Path, []byte(m.Src))
 		bag := diag.New(file)
 
+		var info *resolver.Info
 		prog := parser.New(file, bag).Parse()
 		if !bag.HasErrors() {
 			r := resolver.New(file, bag)
 			for _, name := range stdlib.Names() {
 				r.PredeclareModule(name)
 			}
-			r.Resolve(prog)
+			info = r.Resolve(prog)
 		}
 		if bag.HasErrors() {
 			fmt.Fprintf(errOut, "internal error: the standard library failed to compile\n%s", bag.Render())
@@ -161,7 +162,7 @@ func (i *Interp) loadStdlib(errOut io.Writer) bool {
 		}
 
 		sub := &Interp{
-			file: file, info: nil,
+			file: file, info: info,
 			Out: i.Out, Err: i.Err, In: i.In,
 			globals: i.globals, modules: i.modules,
 			dir: ".", imported: i.imported,
@@ -341,7 +342,7 @@ func (s *Session) Eval(src string) (value.Value, error) {
 	}
 
 	r := resolver.New(file, bag)
-	for name := range s.interp.globals.vars {
+	for _, name := range s.interp.globals.namesInSlotOrder() {
 		r.Predeclare(name)
 	}
 	for name := range s.declared {
@@ -363,6 +364,7 @@ func (s *Session) Eval(src string) (value.Value, error) {
 		return nil, fmt.Errorf("%s", strings.TrimRight(msg, "\n"))
 	}
 
+	s.interp.adoptGlobals(info)
 	s.interp.file = file
 	s.interp.info = info
 
@@ -413,11 +415,12 @@ func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, er
 		return nil, nil, false
 	}
 
-	// Globals first, then modules: predeclaring a name replaces its binding, and
-	// a module's binding is the one its member list is attached to. A module IS
-	// a global, so the other order silently dropped the member checking.
+	// Existing globals are predeclared in slot order, so the resolver numbers
+	// them exactly where the global frame already holds them. Predeclaring is
+	// slot-stable: a name announced twice — a module is a global too — keeps
+	// the slot it had.
 	r := resolver.New(file, bag)
-	for name := range i.globals.vars {
+	for _, name := range i.globals.namesInSlotOrder() {
 		r.Predeclare(name)
 	}
 	i.predeclareModules(r)
@@ -437,5 +440,16 @@ func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, er
 		fmt.Fprint(errOut, msg)
 		return nil, nil, false
 	}
+	i.adoptGlobals(info)
 	return units, info, true
+}
+
+// adoptGlobals lays the global frame out to match a compilation's global
+// bindings, so names the resolver numbered are where it numbered them — and
+// so a later compilation, predeclaring this frame's layout, numbers new names
+// above everything that came before.
+func (i *Interp) adoptGlobals(info *resolver.Info) {
+	for _, b := range info.Globals() {
+		i.globals.reserve(b.Name, b.Slot)
+	}
 }

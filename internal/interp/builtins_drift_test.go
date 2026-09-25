@@ -19,8 +19,8 @@ func TestBuiltinListsAgree(t *testing.T) {
 	i := New(source.NewFile("test.ari", nil), nil)
 
 	installed := []string{}
-	for name, v := range i.globals.vars {
-		if _, ok := v.(*Builtin); ok {
+	for name, slot := range i.globals.names {
+		if _, ok := i.globals.get(slot).(*Builtin); ok {
 			installed = append(installed, name)
 		}
 	}

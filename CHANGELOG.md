@@ -8,6 +8,22 @@ program keeps working, and a breaking change costs a major.
 change what it computes. Diagnostic wording is not covered by the promise and is
 not tracked here.
 
+## Unreleased
+
+### Internals
+
+- **The evaluator runs on the resolver's binding table.** Resolution now
+  produces one immutable table — declaration span, kind, mutability, owner
+  frame, slot and capture mode per binding — and stamps every name in the AST
+  with a binding id and a hop count. The evaluator's scopes are slot frames
+  allocated from the table, so a resolved name is a frame walk of exactly its
+  hop count and one slot index, never a string lookup. `let`, `var`, parameters
+  and loop variables share the one representation, closures hold frames by
+  pointer rather than copying environments, and a failed resolution taints the
+  table so the evaluator refuses to run on it. Builtins and dynamic module
+  members keep a name-keyed path, and the boundary is documented in
+  docs/architecture.md. No language behavior changed.
+
 ## 1.0.0
 
 The first release with a compatibility promise attached. Everything below landed

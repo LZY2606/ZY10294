@@ -133,7 +133,7 @@ func (i *Interp) evalUnits(units []unit) error {
 			// An aliased import gets a scope of its own, which then becomes a
 			// module. A module IS a namespace, so aliasing needs no machinery
 			// the language does not already have.
-			scope = newEnv(i.globals)
+			scope = i.frame(i.globals, u.prog)
 		}
 
 		if _, err := i.runNodes(u.prog, scope); err != nil {
@@ -161,13 +161,15 @@ func (i *Interp) defineModule(name string, prog *ast.Program, scope *env) {
 		if bound == nil {
 			continue
 		}
-		if v, ok := scope.vars[bound.Value]; ok {
-			if _, seen := m.members[bound.Value]; !seen {
-				m.order = append(m.order, bound.Value)
-			}
-			m.members[bound.Value] = v
+		b := i.info.Binding(bound.Binding)
+		if b == nil {
+			continue
 		}
+		if _, seen := m.members[bound.Value]; !seen {
+			m.order = append(m.order, bound.Value)
+		}
+		m.members[bound.Value] = scope.get(b.Slot)
 	}
 	i.modules[name] = m
-	i.globals.define(name, m)
+	i.globals.defineName(name, m)
 }
